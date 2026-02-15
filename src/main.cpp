@@ -1,13 +1,19 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include "driver/gpio.h"
+#include <SPI.h>
 
-// ================= 1. 安全引脚定义 =================
+// ================= 1. 屏幕与触摸安全引脚定义 =================
 #define PIN_WR  17
 #define PIN_RS  18
 #define PIN_CE  21
 #define PIN_RD  38
 #define PIN_RST 47
+
+#define T_CLK   45 
+#define T_MOSI  46
+#define T_MISO  48
+#define T_CS    42  
 
 const int LCD_WIDTH = 640;
 const int LCD_HEIGHT = 480;
@@ -20,11 +26,70 @@ const uint32_t DATA_MASK = 0x0001FFFE;
 #define CE_LOW()    GPIO.out_w1tc = (1 << PIN_CE)
 #define CE_HIGH()   GPIO.out_w1ts = (1 << PIN_CE)
 
-// ================= 2. 底层驱动 =================
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *buf_1;
 static lv_color_t *buf_2;
 
+// 全局 SPI 对象
+SPIClass touchSPI(FSPI);
+
+// ================= 2. 手搓极简 XPT2046 驱动 (完美支持自定义引脚) =================
+// 读取 XPT2046 寄存器的底层函数
+uint16_t xpt2046_read(uint8_t cmd) {
+    uint16_t data = 0;
+    digitalWrite(T_CS, LOW);
+    touchSPI.transfer(cmd);
+    data = touchSPI.transfer16(0x0000) >> 3; // 读 16 位，XPT2046 数据在头 12 位
+    digitalWrite(T_CS, HIGH);
+    return data;
+}
+
+// 供 LVGL 调用的读取回调
+void my_touchpad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data) {
+    // XPT2046 命令控制字节：
+    // 0xD0 (11010000) -> 读 X 坐标 (12位, 差分)
+    // 0x90 (10010000) -> 读 Y 坐标 (12位, 差分)
+    
+    // 连续读几次求个平均，防止屏幕噪点干扰
+    int x = 0, y = 0;
+    int samples = 3;
+    
+    touchSPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0)); // 触摸 SPI 速度 2MHz
+    for(int i=0; i<samples; i++) {
+        x += xpt2046_read(0xD0);
+        y += xpt2046_read(0x90);
+    }
+    touchSPI.endTransaction();
+
+    x /= samples;
+    y /= samples;
+
+    // 判断是否被按下：如果读出的 ADC 值接近 0 或者满载 4095，说明没按或者读到了杂波
+    // 正常按下的 ADC 值通常在 200 ~ 3900 之间
+    if (x > 200 && x < 3900 && y > 200 && y < 3900) {
+        
+        // --- 坐标映射 (需要根据你的屏幕实际方向微调) ---
+        // 假设 X 方向范围是 300~3800，映射到 0~640
+        // 假设 Y 方向范围是 300~3800，映射到 0~480
+        int mapped_x = map(x, 300, 3800, 0, LCD_WIDTH);
+        int mapped_y = map(y, 300, 3800, 0, LCD_HEIGHT);
+
+        // 边界保护
+        if (mapped_x < 0) mapped_x = 0; else if (mapped_x > LCD_WIDTH - 1) mapped_x = LCD_WIDTH - 1;
+        if (mapped_y < 0) mapped_y = 0; else if (mapped_y > LCD_HEIGHT - 1) mapped_y = LCD_HEIGHT - 1;
+
+        data->point.x = mapped_x;
+        data->point.y = mapped_y;
+        data->state = LV_INDEV_STATE_PR; 
+        
+        // 调试用：如果点击没反应，把下面这行注释打开，看串口读到了什么原始数据
+        // Serial.printf("Raw X:%d Y:%d | Mapped X:%d Y:%d\n", x, y, mapped_x, mapped_y);
+    } else {
+        data->state = LV_INDEV_STATE_REL; 
+    }
+}
+
+// ================= 3. 屏幕极速刷新引擎 =================
 void LCD_GPIO_Init() {
     for(int i = 1; i <= 18; i++) pinMode(i, OUTPUT);
     pinMode(PIN_CE, OUTPUT); pinMode(PIN_RD, OUTPUT); pinMode(PIN_RST, OUTPUT);
@@ -35,6 +100,7 @@ void LCD_GPIO_Init() {
 
 void IRAM_ATTR my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
     CE_LOW(); 
+    int width = area->x2 - area->x1 + 1;
     for (int y = area->y1; y <= area->y2; y++) {
         RS_LOW(); GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (0x0020 << 1); WR_LOW(); WR_HIGH();
         RS_HIGH(); GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (y << 1); WR_LOW(); WR_HIGH();
@@ -43,88 +109,72 @@ void IRAM_ATTR my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_
         RS_LOW(); GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (0x0022 << 1); WR_LOW(); WR_HIGH();
 
         RS_HIGH(); 
-        int width = area->x2 - area->x1 + 1;
-        for (int i = 0; i < width; i++) {
-            uint16_t color = color_p->full;
-            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color << 1);
-            WR_LOW(); WR_HIGH();
-            color_p++; 
+        int w = width;
+        while (w >= 8) {
+            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color_p[0].full << 1); WR_LOW(); WR_HIGH();
+            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color_p[1].full << 1); WR_LOW(); WR_HIGH();
+            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color_p[2].full << 1); WR_LOW(); WR_HIGH();
+            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color_p[3].full << 1); WR_LOW(); WR_HIGH();
+            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color_p[4].full << 1); WR_LOW(); WR_HIGH();
+            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color_p[5].full << 1); WR_LOW(); WR_HIGH();
+            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color_p[6].full << 1); WR_LOW(); WR_HIGH();
+            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color_p[7].full << 1); WR_LOW(); WR_HIGH();
+            color_p += 8; w -= 8;
+        }
+        while (w > 0) {
+            GPIO.out_w1tc = DATA_MASK; GPIO.out_w1ts = (color_p->full << 1); WR_LOW(); WR_HIGH();
+            color_p++; w--;
         }
     }
     CE_HIGH(); 
     lv_disp_flush_ready(disp_drv); 
 }
 
-// ================= 3. 实时滚动终端 UI =================
-lv_obj_t * list_view; // 全局列表对象，方便在 loop 里插入数据
-int packet_count = 0; // 模拟抓包数量
 
-void build_radar_terminal() {
-    // 极客风深灰背景
-    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x121212), 0);
-
-    // 顶部状态栏
-    lv_obj_t * header = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(header, LCD_WIDTH, 40);
-    lv_obj_set_style_bg_color(header, lv_color_hex(0x004d40), 0); // 深绿色
-    lv_obj_set_style_border_width(header, 0, 0);
-    lv_obj_set_style_radius(header, 0, 0);
-    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
-    
-    lv_obj_t * title = lv_label_create(header);
-    lv_label_set_text(title, "ESP32-S3 BLE Drone Scanner - ACTV");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x00e676), 0); // 亮绿色
-    lv_obj_center(title);
-
-    // 中间的滚动数据列表区
-    list_view = lv_list_create(lv_scr_act());
-    lv_obj_set_size(list_view, LCD_WIDTH - 20, LCD_HEIGHT - 60);
-    lv_obj_align(list_view, LV_ALIGN_BOTTOM_MID, 0, -10);
-    
-    // 定制列表的赛博朋克样式：透明背景，绿色边框
-    lv_obj_set_style_bg_opa(list_view, 0, 0); 
-    lv_obj_set_style_border_color(list_view, lv_color_hex(0x00e676), 0);
-    lv_obj_set_style_border_width(list_view, 2, 0);
-    lv_obj_set_style_text_color(list_view, lv_color_hex(0x69f0ae), 0); // 柔和的绿色文本
-    
-    // 初始化时加一条开机信息
-    lv_list_add_text(list_view, "[SYS] Scanning initialized. Waiting for packets...");
+// ================= 4. LVGL 测试 UI =================
+static void btn_event_cb(lv_event_t * e) {
+    lv_obj_t * btn = lv_event_get_target(e);
+    lv_obj_t * label = lv_obj_get_child(btn, 0); 
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        lv_label_set_text(label, "Success!");
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x00FF00), 0); 
+        Serial.println("LVGL Hit!");
+    }
 }
 
-// 模拟接收蓝牙数据并插入列表
-void simulate_incoming_data() {
-    packet_count++;
-    
-    char buffer[128];
-    // 随机生成假数据：MAC 地址、信号强度、高度
-    int rssi = -1 * random(40, 95);
-    int alt = random(10, 150);
-    int mac_tail = random(0x10, 0xFF);
-    
-    sprintf(buffer, "[%04d] MAC: AA:BB:CC:DD:EE:%02X | RSSI: %d dBm | ALT: %dm", packet_count, mac_tail, rssi, alt);
-    
-    // 动态添加一行文字到列表
-    lv_list_add_text(list_view, buffer);
-    
-    // 为了防止内存爆炸，如果列表太长，我们删掉最老的（或者直接让它滚动）
-    // LVGL 的 list_add 会自动处理滚动，这里我们为了演示效果，让它自动滚到底部
-    lv_obj_scroll_to_y(list_view, 10000, LV_ANIM_ON); 
+void build_ui() {
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x1a1a1a), 0);
+    lv_obj_t * title = lv_label_create(lv_scr_act());
+    lv_label_set_text(title, "Custom SPI Touch Test");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -80);
+
+    lv_obj_t * btn = lv_btn_create(lv_scr_act());
+    lv_obj_set_size(btn, 200, 80);
+    lv_obj_align(btn, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_add_event_cb(btn, btn_event_cb, LV_EVENT_ALL, NULL);
+
+    lv_obj_t * label = lv_label_create(btn);
+    lv_label_set_text(label, "PRESS ME");
+    lv_obj_center(label);
 }
 
-
-// ================= 4. 主程序 =================
-uint32_t last_sim_time = 0;
-
+// ================= 5. 主程序 =================
 void setup() {
     Serial.begin(115200);
     delay(2000);
     LCD_GPIO_Init();
+    
+    // 初始化触摸硬件
+    pinMode(T_CS, OUTPUT);
+    digitalWrite(T_CS, HIGH);
+    touchSPI.begin(T_CLK, T_MISO, T_MOSI, T_CS);
+
     lv_init();
 
     uint32_t buf_size = LCD_WIDTH * LCD_HEIGHT / 10; 
     buf_1 = (lv_color_t *)heap_caps_malloc(buf_size * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
     buf_2 = (lv_color_t *)heap_caps_malloc(buf_size * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-    
     lv_disp_draw_buf_init(&draw_buf, buf_1, buf_2, buf_size);
 
     static lv_disp_drv_t disp_drv;
@@ -135,18 +185,16 @@ void setup() {
     disp_drv.draw_buf = &draw_buf;
     lv_disp_drv_register(&disp_drv);
 
-    build_radar_terminal();
-    last_sim_time = millis();
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER; 
+    indev_drv.read_cb = my_touchpad_read;   
+    lv_indev_drv_register(&indev_drv);
+
+    build_ui();
 }
 
 void loop() {
     lv_timer_handler(); 
-    
-    // 每隔 800 毫秒，模拟收到一条无人机数据
-    if (millis() - last_sim_time > 800) {
-        simulate_incoming_data();
-        last_sim_time = millis();
-    }
-    
     delay(5); 
 }
